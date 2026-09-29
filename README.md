@@ -85,7 +85,7 @@ non-custodial, no proxy wrappers, tested end-to-end on testnet.
 
 ## Enforcement scope — read this before relying on the caps
 
-Full recipient/amount enforcement — spend caps, allowlists, per-transaction limits — is native and automatic for SAC token transfers (`transfer`/`transfer_from`), since these are the calls whose arguments the Soroban auth context exposes for inspection. For other Soroban contract calls made by the guarded account (arbitrary DEX/lending/protocol calls), the policy engine still enforces window and pause state, but per-call amount/recipient limits are not yet enforced — extending fine-grained enforcement to arbitrary calls is tracked as a v2 item, not implied as already covered.
+Full recipient/amount enforcement — spend caps, allowlists, per-transaction limits — is native and automatic for SAC token transfers (`transfer`/`transfer_from`), since these are the calls whose arguments the Soroban auth context exposes for inspection. For other Soroban contract calls, per-call amount/recipient limits are not yet enforced — full statement: [SPEC §2](SPEC.md#2-enforcement-scope--sac-token-calls-vs-every-other-soroban-call-required-framing).
 
 This boundary is an inherent property of the platform (the auth context does not expose arbitrary call arguments generically), not a gap this project hides or overclaims. The classification that produces this boundary (`AssetTransfer` vs `Protocol` vs `Unknown` default-deny) is spelled out in SPEC §6.
 
@@ -96,7 +96,7 @@ This boundary is an inherent property of the platform (the auth context does not
 git clone https://github.com/aigbagbobila/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 30 tests, isolated (no network)
+cargo test                                      # 45 tests, isolated (no network)
 
 # Read live state from the Phase-1 testnet deployment (no auth, simulation only)
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
@@ -186,6 +186,10 @@ Admin-only. Re-binds the agent's Ed25519 public key. The admin never gains fund-
 power — it can only replace the key the account will authenticate. Verified live
 (simulation): emits `EventAgentRotated`.
 
+Full operational runbook — scheduled rotation, suspected-leak ordering
+(freeze → rotate → unfreeze), rollback, and the admin-key immutability
+statement: [`docs/key-rotation.md`](docs/key-rotation.md).
+
 ### `heartbeat`
 ```rust
 pub fn heartbeat(env: Env)
@@ -212,6 +216,35 @@ pre-flight, blocked-reason handling, DMS stop conditions), see
 The TypeScript equivalent is the SDK's
 [agent-runtime guide issue](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-sdk/issues/74).
 
+#### Check a transfer without broadcasting
+
+`agent-tx preflight` simulates a transfer against current ledger state and
+never submits it. With the registered agent secret, the signed auth entry runs
+the real `__check_auth`; an admitted transfer prints an estimated fee, while a
+policy denial prints the `auth_checked` diagnostic reason. The estimate is
+`minResourceFee + inclusion fee + guard-footprint fee allowance`; it is not a
+guarantee of the eventual inclusion fee.
+
+```bash
+cd tools/agent-tx && cargo build --release
+./target/release/agent-tx preflight \
+  --guard CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
+  --asset CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7 \
+  --to GDUYLFVFLVISVOM5FK5KTBA446VQQ7NBRRFMLNLKLISKL26LJGKUVRRX \
+  --amount 1100 --secret "$AGENT_SECRET"
+# BLOCKED (pre-broadcast, enforced simulation)
+# diagnostic event: auth_checked, blocked, per_tx_cap_exceeded
+# broadcast: no
+```
+
+The example exceeds the fixture policy's `per_tx_cap: 1000`. Exit codes:
+`0` means signed simulation admitted the call, `1` means signed simulation
+blocked it, and `2` means the unsigned simulation was inconclusive. `--secret`
+is optional (or supplied via `AGENT_SECRET`): without it the tool retrieves the
+registered public key and estimates a fee, but cannot sign the custom-account
+authorization, so it cannot establish whether `__check_auth` will admit the
+transfer. See [`tools/agent-tx/README.md`](tools/agent-tx/README.md) for details.
+
 ### `freeze` / `unfreeze`
 ```rust
 pub fn freeze(env: Env)      // admin only — sets AdminFrozen = true
@@ -221,6 +254,14 @@ pub fn unfreeze(env: Env)    // admin only — clears AdminFrozen, LastHeartbeat
 `unfreeze` is the admin's liveness attestation that revives a dead-man-frozen account.
 Both are admin-only (`require_auth(Admin)`). Verified live (simulation): `freeze` emits
 `EventFrozen`, `unfreeze` emits `EventUnfrozen`.
+
+> ⚠️ **`unfreeze` re-arms the dead-man switch.** One call does two jobs: it clears
+> `AdminFrozen` *and* sets `LastHeartbeat = now` on the admin's authority. If the DMS
+> grace had already elapsed when you unfreeze, you have just silently restarted the
+> liveness clock — the account will not self-freeze again until the grace lapses once
+> more. The emitted `event_unfrozen` carries `rearmed_dms: bool` (`true` = the call
+> changed `LastHeartbeat`, i.e. the clock was re-armed; `false` = it was already
+> `now`) so telemetry and audits can surface exactly that side effect. See [SPEC §5](SPEC.md#5-dead-man-switch--precise-definition).
 
 The real Phase-1 unfreeze — the DMS-reversal transaction verified on-chain (tx
 `dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5`):
@@ -536,11 +577,11 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-30 tests (unit + integration) cover the policy decision engine — including the regression
+45 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `30 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `45 passed; 0 failed`.
 
 ```bash
 cargo test
